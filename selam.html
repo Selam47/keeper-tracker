@@ -6,6 +6,7 @@
 <title>Keeper Tracker</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'DM Sans', system-ui, sans-serif; background: #f8f7f4; min-height: 100vh; }
@@ -54,9 +55,10 @@ button:active { transform: scale(0.97); }
 
 <script>
 const { createClient } = supabase;
+if (!window.KEEPER_CONFIG) throw new Error('config.js bulunamadı. config.example.js dosyasını config.js olarak kopyalayın ve bilgilerinizi girin.');
 const sb = createClient(
-  'https://tecqsnvuhmrczwvxnmmn.supabase.co',
-  'sb_publishable_lotb-7J0n5FZJOQLwa-LUQ_CF7elOLy'
+  window.KEEPER_CONFIG.supabaseUrl,
+  window.KEEPER_CONFIG.supabaseAnonKey
 );
 
 const KEEPER_SERVICE = 0xFEF5;
@@ -76,6 +78,7 @@ let state = {
   devices: [],
   selectedDeviceId: null,
   connecting: false,
+  connectError: null,
   findPhoneActive: false,
   ledStates: {},
   editingDevice: false,
@@ -168,8 +171,15 @@ function playFindPhone() {
 }
 
 async function addDevice() {
-  if (!navigator.bluetooth) { alert("Bu tarayıcı Bluetooth desteklemiyor. Chrome kullanın."); return; }
-  state.connecting = true; render();
+  state.connectError = null;
+  if (!navigator.bluetooth) {
+    state.connectError = "Bluetooth bu tarayıcıda desteklenmiyor. Android Chrome kullanın.";
+    render();
+    return;
+  }
+  state.connecting = true;
+  render();
+  await new Promise(r => setTimeout(r, 50));
   try {
     const btDevice = await navigator.bluetooth.requestDevice({
       filters: [{ services: [KEEPER_SERVICE] }],
