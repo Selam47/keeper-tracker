@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="tr">
+<body>
+    <h2>Keeper Bağlantı Testi</h2>
+    <button id="connectBtn" style="padding: 20px; font-size: 16px;">Cihaz Ara ve Bağlan</button>
+    <div id="status">Durum: Bekleniyor...</div>
+
+    <script>
+        document.getElementById('connectBtn').addEventListener('click', async () => {
+            const statusDiv = document.getElementById('status');
+            statusDiv.innerText = "Cihaz aranıyor...";
+
+            try {
+                // Filtreleme ve opsiyonel servisler
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [0xFEF5] }],
+                    optionalServices: [0x180F, "6d696368-616c-206f-6c65-737a637a796b"]
+                });
+
+                statusDiv.innerText = "Bağlanıyor: " + device.name;
+                const server = await device.gatt.connect();
+                statusDiv.innerText = "BAĞLANDI: " + device.name;
+                console.log("Cihaz:", device);
+
+            } catch (error) {
+                console.error("Hata Detayı:", error);
+                statusDiv.innerText = "Hata: " + error.message;
+            }
+        });
+    </script>
+</body>
+</html>
