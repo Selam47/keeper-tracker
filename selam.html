@@ -6,7 +6,6 @@
 <title>Keeper Tracker</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="config.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'DM Sans', system-ui, sans-serif; background: #f8f7f4; min-height: 100vh; }
@@ -55,11 +54,9 @@ button:active { transform: scale(0.97); }
 
 <script>
 const { createClient } = supabase;
-if (!window.KEEPER_CONFIG) throw new Error('config.js bulunamadı. config.example.js dosyasını config.js olarak kopyalayın ve bilgilerinizi girin.');
-const sb = createClient(
-  window.KEEPER_CONFIG.supabaseUrl,
-  window.KEEPER_CONFIG.supabaseAnonKey
-);
+const supabaseUrl = 'https://tecqsnvuhmrczwvxnmmn.supabase.co';
+const supabaseAnonKey = 'sb_publishable_lotb-7J0n5FZJOQLwa-LUQ_CF7elOLy';
+const sb = createClient(supabaseUrl, supabaseAnonKey);
 
 const KEEPER_SERVICE = 0xFEF5;
 const BATTERY_SERVICE = 0x180F;
@@ -269,9 +266,17 @@ async function addDevice() {
       state.devices.push(dev);
     }
   } catch (e) {
-    if (e.name !== "NotFoundError") console.error(e);
+    if (e.name === "NotFoundError" || e.name === "AbortError") {
+    } else if (e.name === "SecurityError") {
+      state.connectError = "Güvenlik hatası: Sayfanın HTTPS üzerinde açık olduğundan emin olun.";
+    } else if (e.name === "NotSupportedError") {
+      state.connectError = "Bu cihaz veya tarayıcı BLE desteklemiyor.";
+    } else {
+      state.connectError = "Bağlantı hatası: " + (e.message || e.name);
+    }
   }
-  state.connecting = false; render();
+  state.connecting = false;
+  render();
 }
 
 async function toggleLed(deviceId) {
@@ -505,6 +510,7 @@ function renderHome(app) {
     </div>
     ${deviceCards}
     <div style="padding:12px 16px 24px">
+      ${state.connectError ? `<div style="background:#fef2f2;border:1.5px solid #fecaca;border-radius:12px;padding:12px 14px;margin-bottom:12px;font-size:13px;color:#dc2626;display:flex;align-items:flex-start;gap:8px"><span style="font-size:16px;flex-shrink:0">⚠️</span><span>${state.connectError}</span></div>` : ''}
       <button class="btn btn-primary" onclick="addDevice()" ${state.connecting ? 'disabled' : ''} style="display:flex;align-items:center;justify-content:center;gap:8px;${state.connecting ? 'opacity:0.7' : ''}">
         ${state.connecting ? '<span class="spinner"></span> Aranıyor...' : '➕ Cihaz Ekle'}
       </button>
