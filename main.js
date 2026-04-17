@@ -60,12 +60,12 @@ async function detectEnvironment() {
 
 function getSettings() {
   const uid = state.currentUser?.id || 'anon'
-  return JSON.parse(localStorage.getItem('keeper_settings_' + uid) || '{"notifications":true,"distanceAlert":true,"distanceThreshold":15,"soundOnFind":true}')
+  return JSON.parse(localStorage.getItem('BT Tracker_settings_' + uid) || '{"notifications":true,"distanceAlert":true,"distanceThreshold":15,"soundOnFind":true}')
 }
 
 function saveSettings(s) {
   const uid = state.currentUser?.id || 'anon'
-  localStorage.setItem('keeper_settings_' + uid, JSON.stringify(s))
+  localStorage.setItem('BT Tracker_settings_' + uid, JSON.stringify(s))
 }
 
 function getUserDisplayName() {
@@ -87,7 +87,7 @@ async function getCurrentLocation() {
 async function loadDevices() {
   if (!state.currentUser) { state.devices = []; return }
   const { data, error } = await sb
-    .from('keeper_devices')
+    .from('BT Tracker_devices')
     .select('*')
     .eq('user_id', state.currentUser.id)
   if (error) { console.error(error); return }
@@ -107,7 +107,7 @@ async function loadDevices() {
 
 async function syncDevice(d) {
   if (!state.currentUser) return
-  const { error } = await sb.from('keeper_devices').update({
+  const { error } = await sb.from('BT Tracker_devices').update({
     device_name: d.name,
     icon: d.icon || '🔑',
     battery_level: d.battery,
@@ -242,7 +242,7 @@ async function addDevice() {
       render()
     })
 
-    const { error } = await sb.from('keeper_devices').upsert({
+    const { error } = await sb.from('BT Tracker_devices').upsert({
       user_id: state.currentUser.id,
       device_id: id,
       device_name: dev.name,
@@ -300,7 +300,7 @@ function disconnectDevice(deviceId) {
 
 async function deleteDevice(deviceId) {
   disconnectDevice(deviceId)
-  const { error } = await sb.from('keeper_devices').delete()
+  const { error } = await sb.from('BT Tracker_devices').delete()
     .eq('user_id', state.currentUser.id)
     .eq('device_id', deviceId)
   if (error) console.error(error)
