@@ -1,9 +1,14 @@
 import { createClient } from '@supabase/supabase-js'
 
-const sb = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_ANON_KEY
-)
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  document.body.innerHTML = '<div style="padding:40px;font-family:system-ui;color:#dc2626;text-align:center"><h2>Yapılandırma Hatası</h2><p>VITE_SUPABASE_URL ve VITE_SUPABASE_ANON_KEY .env dosyasında tanımlı olmalı.</p></div>'
+  throw new Error('Missing Supabase env vars')
+}
+
+const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 const KEEPER_SERVICE = 0xFEF5
 const BATTERY_SERVICE = 0x180F
@@ -11,9 +16,6 @@ const BATTERY_CHAR = 0x2A19
 const LED_CHAR = '8082caa8-41a6-4021-91c6-56f9b954cc34'
 const BUTTON_SERVICE = '6d696368-616c-206f-6c65-737a637a796b'
 const BUTTON_CHAR = '66696c69-7020-726f-6d61-6e6f77736b69'
-const CHAR2 = '724249f0-5ec3-4b5f-8804-42345af08651'
-const CHAR3 = '9d84b9a3-000c-49d8-9183-855b673fda31'
-const CHAR4 = '457871e8-d516-4ca1-9116-57d0b17b9cb2'
 const ICONS = ['🔑','🎒','👜','💼','🚗','🐱','🐶','📱','💳','🧸']
 
 const state = {
@@ -24,12 +26,37 @@ const state = {
   connecting: false,
   connectError: null,
   findPhoneActive: false,
-  ledStates: {},
+  ringingDeviceId: null,
   editingDevice: false,
   editName: '',
-  editIcon: ''
+  editIcon: '',
+  envSupport: { ble: true, brave: false, secure: true, message: '' }
 }
 const bleData = {}
+
+async function detectEnvironment() {
+  const env = { ble: true, brave: false, secure: true, message: '' }
+  if (window.isSecureContext === false) {
+    env.secure = false
+    env.message = 'Sayfa HTTPS üzerinde açılmalı. Web Bluetooth yalnızca güvenli bağlamda çalışır.'
+  }
+  if (!('bluetooth' in navigator)) {
+    env.ble = false
+    if (!env.message) env.message = 'Web Bluetooth bu tarayıcıda desteklenmiyor. Android Chrome veya Edge kullanın.'
+  }
+  try {
+    if (navigator.brave && typeof navigator.brave.isBrave === 'function') {
+      const isBrave = await navigator.brave.isBrave()
+      if (isBrave) {
+        env.brave = true
+        if (!env.ble) {
+          env.message = 'Brave Shields Web Bluetooth\'u engelliyor olabilir. brave://flags/#brave-web-bluetooth-api ayarını etkinleştirin.'
+        }
+      }
+    }
+  } catch (e) {}
+  return env
+}
 
 function getSettings() {
   const uid = state.currentUser?.id || 'anon'
@@ -43,6 +70,18 @@ function saveSettings(s) {
 
 function getUserDisplayName() {
   return state.currentUser?.user_metadata?.name || state.currentUser?.email || ''
+}
+
+async function getCurrentLocation() {
+  if (!navigator.geolocation) return null
+  try {
+    const pos = await new Promise((res, rej) => {
+      navigator.geolocation.getCurrentPosition(res, rej, { timeout: 8000, enableHighAccuracy: true, maximumAge: 30000 })
+    })
+    return { lat: pos.coords.latitude, lng: pos.coords.longitude, time: Date.now() }
+  } catch (e) {
+    return null
+  }
 }
 
 async function loadDevices() {
@@ -68,7 +107,7 @@ async function loadDevices() {
 
 async function syncDevice(d) {
   if (!state.currentUser) return
-  await sb.from('keeper_devices').update({
+  const { error } = await sb.from('keeper_devices').update({
     device_name: d.name,
     icon: d.icon || '🔑',
     battery_level: d.battery,
@@ -78,6 +117,7 @@ async function syncDevice(d) {
   })
     .eq('user_id', state.currentUser.id)
     .eq('device_id', d.id)
+  if (error) console.error(error)
 }
 
 function rssiToProximity(rssi) {
@@ -118,7 +158,9 @@ async function addDevice() {
   state.connectError = null
 
   if (!navigator.bluetooth) {
-    state.connectError = 'Bluetooth bu tarayıcıda desteklenmiyor. Android Chrome kullanın.'
+    const env = await detectEnvironment()
+    state.envSupport = env
+    state.connectError = env.message || 'Bluetooth bu tarayıcıda desteklenmiyor.'
     render()
     return
   }
@@ -131,14 +173,13 @@ async function addDevice() {
     })
   } catch (e) {
     if (e.name === 'NotFoundError' || e.name === 'AbortError') return
+    let msg = e.name + ': ' + e.message
     if (e.name === 'SecurityError') {
-      alert('Güvenlik hatası: ' + e.message + '\n\nSayfa HTTPS üzerinde açık olmalı ve Bluetooth izni verilmeli.')
+      msg = 'Güvenlik hatası. Sayfa HTTPS üzerinde açık olmalı ve Bluetooth izni verilmeli.'
     } else if (e.name === 'NotSupportedError') {
-      alert('BLE Desteklenmiyor: ' + e.message)
-    } else {
-      alert('Bluetooth hatası [' + e.name + ']: ' + e.message)
+      msg = 'BLE Desteklenmiyor. Brave kullanıyorsanız Shields kapalı olmalı ve brave://flags/#brave-web-bluetooth-api etkin olmalı.'
     }
-    state.connectError = e.name + ': ' + e.message
+    state.connectError = msg
     render()
     return
   }
@@ -150,11 +191,8 @@ async function addDevice() {
     const server = await btDevice.gatt.connect()
     const service = await server.getPrimaryService(KEEPER_SERVICE)
 
-    let charLed = null, char2 = null, char3 = null, char4 = null
+    let charLed = null
     try { charLed = await service.getCharacteristic(LED_CHAR) } catch (e) {}
-    try { char2 = await service.getCharacteristic(CHAR2) } catch (e) {}
-    try { char3 = await service.getCharacteristic(CHAR3) } catch (e) {}
-    try { char4 = await service.getCharacteristic(CHAR4) } catch (e) {}
 
     let battery = null
     try {
@@ -173,16 +211,12 @@ async function addDevice() {
       })
     } catch (e) {}
 
-    let loc = null
-    try {
-      const pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 5000 }))
-      loc = { lat: pos.coords.latitude, lng: pos.coords.longitude, time: Date.now() }
-    } catch (e) {}
+    const loc = await getCurrentLocation()
 
     const id = btDevice.id || 'keeper-' + Date.now()
     const existing = state.devices.find(d => d.id === id)
 
-    bleData[id] = { charLed, char2, char3, char4, server, btDevice }
+    bleData[id] = { charLed, server, btDevice }
 
     const dev = {
       id,
@@ -192,19 +226,15 @@ async function addDevice() {
       connected: true,
       rssi: null,
       lastSeen: Date.now(),
-      lastLocation: loc
+      lastLocation: loc || existing?.lastLocation || null
     }
 
     btDevice.addEventListener('gattserverdisconnected', async () => {
       const d = state.devices.find(x => x.id === id)
       if (d) { d.connected = false; d.rssi = null; d.lastSeen = Date.now() }
       delete bleData[id]
-      if (navigator.geolocation) {
-        try {
-          const pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej))
-          if (d) d.lastLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude, time: Date.now() }
-        } catch (e) {}
-      }
+      const discLoc = await getCurrentLocation()
+      if (d && discLoc) d.lastLocation = discLoc
       if (d) await syncDevice(d)
       if (getSettings().notifications && 'Notification' in window && Notification.permission === 'granted') {
         new Notification('Keeper Tracker', { body: dev.name + ' bağlantısı kesildi!' })
@@ -218,8 +248,8 @@ async function addDevice() {
       device_name: dev.name,
       icon: dev.icon,
       battery_level: dev.battery,
-      last_known_lat: loc?.lat ?? null,
-      last_known_lng: loc?.lng ?? null,
+      last_known_lat: dev.lastLocation?.lat ?? null,
+      last_known_lng: dev.lastLocation?.lng ?? null,
       last_seen: new Date(dev.lastSeen).toISOString()
     }, { onConflict: 'user_id,device_id' })
 
@@ -231,33 +261,36 @@ async function addDevice() {
       state.devices.push(dev)
     }
   } catch (e) {
-    alert('Bağlantı hatası [' + e.name + ']: ' + e.message)
-    state.connectError = e.name + ': ' + e.message
+    state.connectError = 'Bağlantı hatası: ' + e.message
   }
 
   state.connecting = false
   render()
 }
 
-async function toggleLed(deviceId) {
+async function ringDevice(deviceId) {
   const ble = bleData[deviceId]
-  if (!ble || !ble.charLed) return
-  const on = !state.ledStates[deviceId]
-  try {
-    await ble.charLed.writeValue(new Uint8Array([on ? 0x01 : 0x00]))
-    state.ledStates[deviceId] = on
+  if (!ble || !ble.charLed) {
+    state.connectError = 'Cihaz bağlı değil veya uyarı karakteristiği bulunamadı.'
     render()
-  } catch (e) { console.error(e) }
-}
-
-async function tryRing(deviceId) {
-  const ble = bleData[deviceId]
-  if (!ble) return
-  const chars = [ble.char2, ble.char3, ble.char4, ble.charLed]
-  for (const c of chars) {
-    if (!c) continue
-    try { await c.writeValue(new Uint8Array([0x01])) } catch (e) {}
+    return
   }
+  if (!ble.server || !ble.server.connected) {
+    state.connectError = 'GATT bağlantısı kopmuş. Yeniden bağlanın.'
+    render()
+    return
+  }
+  state.ringingDeviceId = deviceId
+  render()
+  try {
+    await ble.charLed.writeValue(new Uint8Array([0x01]))
+  } catch (e) {
+    state.connectError = 'Ring komutu gönderilemedi: ' + e.message
+  }
+  setTimeout(() => {
+    state.ringingDeviceId = null
+    render()
+  }, 3000)
 }
 
 function disconnectDevice(deviceId) {
@@ -298,6 +331,16 @@ function render() {
   if (state.page === 'settings') return renderSettings(app)
   if (state.page === 'detail' && state.selectedDeviceId) return renderDetail(app)
   renderHome(app)
+}
+
+function renderEnvWarning() {
+  const env = state.envSupport
+  if (env.ble && env.secure) return ''
+  return `
+    <div style="background:#fef2f2;border:1.5px solid #fecaca;border-radius:12px;padding:12px 14px;margin:12px 16px;font-size:13px;color:#dc2626;display:flex;align-items:flex-start;gap:8px">
+      <span style="font-size:16px;flex-shrink:0">⚠️</span>
+      <span>${env.message}</span>
+    </div>`
 }
 
 function renderLogin(app) {
@@ -420,37 +463,45 @@ function renderHome(app) {
     state.devices.forEach(d => {
       const prox = rssiToProximity(d.rssi)
       const isOn = d.connected
+      const ringing = state.ringingDeviceId === d.id
       deviceCards += `
-        <div class="device-card fade-in" onclick="window._kt.openDetail('${d.id}')">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start">
-            <div style="display:flex;align-items:center;gap:12px">
-              <div class="icon-box" style="background:${isOn ? '#ecfdf5' : '#f3f4f6'}">${d.icon || '🔑'}</div>
-              <div>
-                <div style="font-size:16px;font-weight:600;color:#1a1a2e">${d.name}</div>
-                <div style="font-size:12px;color:${isOn ? '#10b981' : '#9ca3af'};margin-top:2px;display:flex;align-items:center;gap:4px">
-                  <span class="status-dot" style="background:${isOn ? '#10b981' : '#d1d5db'}"></span>
-                  ${isOn ? 'Bağlı' : 'Son: ' + timeAgo(d.lastSeen)}
+        <div class="device-card fade-in">
+          <div onclick="window._kt.openDetail('${d.id}')" style="cursor:pointer">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start">
+              <div style="display:flex;align-items:center;gap:12px">
+                <div class="icon-box" style="background:${isOn ? '#ecfdf5' : '#f3f4f6'}">${d.icon || '🔑'}</div>
+                <div>
+                  <div style="font-size:16px;font-weight:600;color:#1a1a2e">${d.name}</div>
+                  <div style="font-size:12px;color:${isOn ? '#10b981' : '#9ca3af'};margin-top:2px;display:flex;align-items:center;gap:4px">
+                    <span class="status-dot" style="background:${isOn ? '#10b981' : '#d1d5db'}"></span>
+                    ${isOn ? 'Bağlı' : 'Son: ' + timeAgo(d.lastSeen)}
+                  </div>
                 </div>
               </div>
+              ${d.battery != null ? `
+                <div style="display:flex;align-items:center;gap:4px;background:${d.battery < 20 ? '#fef2f2' : '#f0fdf4'};padding:4px 10px;border-radius:8px">
+                  <span style="font-size:13px">${d.battery < 20 ? '🪫' : '🔋'}</span>
+                  <span style="font-size:12px;font-weight:600;color:${d.battery < 20 ? '#dc2626' : '#16a34a'}">${d.battery}%</span>
+                </div>` : ''}
             </div>
-            ${d.battery != null ? `
-              <div style="display:flex;align-items:center;gap:4px;background:${d.battery < 20 ? '#fef2f2' : '#f0fdf4'};padding:4px 10px;border-radius:8px">
-                <span style="font-size:13px">${d.battery < 20 ? '🪫' : '🔋'}</span>
-                <span style="font-size:12px;font-weight:600;color:${d.battery < 20 ? '#dc2626' : '#16a34a'}">${d.battery}%</span>
+            ${isOn ? `
+              <div style="margin-top:14px">
+                <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+                  <span style="font-size:12px;color:#6b7280">Mesafe</span>
+                  <span style="font-size:12px;font-weight:600;color:${prox.color}">${prox.label} (${prox.m})</span>
+                </div>
+                <div class="prox-bar"><div class="prox-fill" style="width:${prox.pct}%;background:${prox.color}"></div></div>
+              </div>` : ''}
+            ${d.lastLocation ? `
+              <div style="margin-top:12px;padding:10px 12px;background:#fafaf8;border-radius:10px;font-size:12px;color:#6b7280;display:flex;justify-content:space-between;align-items:center">
+                <span>📍 ${d.lastLocation.lat.toFixed(4)}, ${d.lastLocation.lng.toFixed(4)} · ${timeAgo(d.lastLocation.time || d.lastSeen)}</span>
+                <a href="https://www.google.com/maps?q=${d.lastLocation.lat},${d.lastLocation.lng}" target="_blank" onclick="event.stopPropagation()" style="color:#4f46e5;text-decoration:none;font-weight:600">Harita →</a>
               </div>` : ''}
           </div>
           ${isOn ? `
-            <div style="margin-top:14px">
-              <div style="display:flex;justify-content:space-between;margin-bottom:6px">
-                <span style="font-size:12px;color:#6b7280">Mesafe</span>
-                <span style="font-size:12px;font-weight:600;color:${prox.color}">${prox.label} (${prox.m})</span>
-              </div>
-              <div class="prox-bar"><div class="prox-fill" style="width:${prox.pct}%;background:${prox.color}"></div></div>
-            </div>` : ''}
-          ${d.lastLocation && !isOn ? `
-            <div style="margin-top:12px;padding:10px 12px;background:#fafaf8;border-radius:10px;font-size:12px;color:#6b7280">
-              📍 Son konum: ${d.lastLocation.lat.toFixed(4)}, ${d.lastLocation.lng.toFixed(4)}
-            </div>` : ''}
+            <button class="btn" style="margin-top:14px;background:${ringing ? '#f59e0b' : 'linear-gradient(135deg,#4f46e5,#7c3aed)'};color:#fff;display:flex;align-items:center;justify-content:center;gap:8px" onclick="event.stopPropagation();window._kt.ringDevice('${d.id}')" ${ringing ? 'disabled' : ''}>
+              ${ringing ? '<span class="spinner"></span> Cihaz Çalıyor...' : '🔔 Cihazı Çaldır'}
+            </button>` : ''}
         </div>`
     })
   }
@@ -463,6 +514,7 @@ function renderHome(app) {
       </div>
       <button class="settings-btn" onclick="window._kt.goTo('settings')">⚙️</button>
     </div>
+    ${renderEnvWarning()}
     <div style="display:flex;gap:10px;margin:16px 16px 8px">
       <div class="stat-card"><div class="stat-label">Toplam</div><div class="stat-value" style="color:#1a1a2e">${state.devices.length}</div></div>
       <div class="stat-card"><div class="stat-label">Bağlı</div><div class="stat-value" style="color:#10b981">${onlineCount}</div></div>
@@ -471,17 +523,20 @@ function renderHome(app) {
     ${deviceCards}
     <div style="padding:12px 16px 24px">
       ${state.connectError ? `<div style="background:#fef2f2;border:1.5px solid #fecaca;border-radius:12px;padding:12px 14px;margin-bottom:12px;font-size:13px;color:#dc2626;display:flex;align-items:flex-start;gap:8px"><span style="font-size:16px;flex-shrink:0">⚠️</span><span>${state.connectError}</span></div>` : ''}
-      <button class="btn btn-primary" onclick="window._kt.addDevice()" ${state.connecting ? 'disabled' : ''} style="display:flex;align-items:center;justify-content:center;gap:8px;${state.connecting ? 'opacity:0.7' : ''}">
+      <button class="btn btn-primary" id="add-device-btn" ${state.connecting ? 'disabled' : ''} style="display:flex;align-items:center;justify-content:center;gap:8px;${state.connecting ? 'opacity:0.7' : ''}">
         ${state.connecting ? '<span class="spinner"></span> Bağlanıyor...' : '➕ Cihaz Ekle'}
       </button>
     </div>`
+
+  const addBtn = document.getElementById('add-device-btn')
+  if (addBtn) addBtn.addEventListener('click', addDevice, { passive: true })
 }
 
 function renderDetail(app) {
   const d = state.devices.find(x => x.id === state.selectedDeviceId)
   if (!d) { state.page = 'home'; render(); return }
   const prox = rssiToProximity(d.rssi)
-  const ledOn = state.ledStates[d.id] || false
+  const ringing = state.ringingDeviceId === d.id
 
   let editSection = ''
   if (state.editingDevice) {
@@ -519,6 +574,12 @@ function renderDetail(app) {
     </div>
 
     ${d.connected ? `
+      <div class="card fade-in" style="text-align:center">
+        <button class="btn" style="background:${ringing ? '#f59e0b' : 'linear-gradient(135deg,#4f46e5,#7c3aed)'};color:#fff;font-size:16px;padding:18px;display:flex;align-items:center;justify-content:center;gap:10px" onclick="window._kt.ringDevice('${d.id}')" ${ringing ? 'disabled' : ''}>
+          ${ringing ? '<span class="spinner"></span> Cihaz Çalıyor...' : '🔔 Cihazı Çaldır'}
+        </button>
+        <div style="font-size:12px;color:#9ca3af;margin-top:8px">Fiziksel alarm / LED aktif olacak</div>
+      </div>
       <div class="card fade-in">
         <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:12px">📶 Yakınlık</div>
         <div style="text-align:center;margin-bottom:12px">
@@ -527,21 +588,10 @@ function renderDetail(app) {
         </div>
         <div class="prox-bar"><div class="prox-fill" style="width:${prox.pct}%;background:${prox.color}"></div></div>
         ${d.rssi ? `<div style="font-size:11px;color:#9ca3af;margin-top:6px;text-align:right">RSSI: ${d.rssi} dBm</div>` : ''}
-      </div>
-      <div class="card fade-in">
-        <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:14px">Kontroller</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-          <button class="control-btn" style="background:${ledOn ? '#fef3c7' : '#f0efec'};color:#1a1a2e" onclick="window._kt.toggleLed('${d.id}')">
-            <span style="font-size:28px">${ledOn ? '💡' : '🔦'}</span>${ledOn ? 'LED Kapat' : 'LED Yak'}
-          </button>
-          <button class="control-btn" style="background:#f0efec;color:#1a1a2e" onclick="window._kt.tryRing('${d.id}')">
-            <span style="font-size:28px">🔔</span>Sesle Bul
-          </button>
-        </div>
       </div>` : `
       <div class="card fade-in" style="text-align:center;padding:24px">
         <div style="font-size:14px;color:#6b7280;margin-bottom:12px">Cihaz bağlı değil</div>
-        <button class="btn btn-primary" onclick="window._kt.addDevice()">Yeniden Bağlan</button>
+        <button class="btn btn-primary" id="reconnect-btn">Yeniden Bağlan</button>
       </div>`}
 
     ${d.lastLocation ? `
@@ -549,7 +599,7 @@ function renderDetail(app) {
         <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:8px">📍 Son Bilinen Konum</div>
         <div style="background:#fafaf8;border-radius:12px;padding:14px">
           <div style="font-size:13px;color:#6b7280">${d.lastLocation.lat.toFixed(6)}, ${d.lastLocation.lng.toFixed(6)}</div>
-          <div style="font-size:11px;color:#9ca3af;margin-top:4px">${timeAgo(d.lastLocation.time)}</div>
+          <div style="font-size:11px;color:#9ca3af;margin-top:4px">${timeAgo(d.lastLocation.time || d.lastSeen)}</div>
           <a href="https://www.google.com/maps?q=${d.lastLocation.lat},${d.lastLocation.lng}" target="_blank" style="display:inline-block;margin-top:10px;font-size:13px;color:#4f46e5;text-decoration:none;font-weight:500">Haritada Göster →</a>
         </div>
       </div>` : ''}
@@ -561,6 +611,9 @@ function renderDetail(app) {
       <button class="btn btn-danger" style="margin-top:8px" onclick="if(confirm('Bu cihazı silmek istediğinize emin misiniz?')) window._kt.deleteDevice('${d.id}')">Cihazı Kaldır</button>
     </div>
     <div style="height:30px"></div>`
+
+  const reconnectBtn = document.getElementById('reconnect-btn')
+  if (reconnectBtn) reconnectBtn.addEventListener('click', addDevice, { passive: true })
 }
 
 async function saveDeviceEdit(id) {
@@ -654,8 +707,7 @@ sb.auth.onAuthStateChange((event, session) => {
 
 window._kt = {
   addDevice,
-  toggleLed,
-  tryRing,
+  ringDevice,
   doLogin,
   doRegister,
   doLogout,
@@ -674,6 +726,7 @@ window._kt = {
 }
 
 async function init() {
+  state.envSupport = await detectEnvironment()
   const { data: { session } } = await sb.auth.getSession()
   if (session) {
     state.currentUser = session.user
