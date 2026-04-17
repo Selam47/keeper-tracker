@@ -13,9 +13,20 @@ const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 const TRACKER_SERVICE = 0xFEF5
 const BATTERY_SERVICE = 0x180F
 const BATTERY_CHAR = 0x2A19
-const LED_CHAR = '8082caa8-41a6-4021-91c6-56f9b954cc34'
-const BUTTON_SERVICE = '6d696368-616c-206f-6c65-737a637a796b'
-const BUTTON_CHAR = '66696c69-7020-726f-6d61-6e6f77736b69'
+const IMMEDIATE_ALERT_SERVICE = 0x1802
+const ALERT_LEVEL_CHAR = 0x2A06
+const BUTTON_SERVICE_UUID = '6d696368-616c-206f-6c65-737a637a796b'
+const BUTTON_CHAR_UUID = '8082caa8-41a6-4021-91c6-56f9b954cc34'
+const LEGACY_BUTTON_CHAR_UUID = '66696c69-7020-726f-6d61-6e6f77736b69'
+
+const ALERT_NONE = 0x00
+const ALERT_MILD = 0x01
+const ALERT_HIGH = 0x02
+
+const MEASURED_POWER = -59
+const N_PATH_LOSS = 2.0
+
+const TABLE = 'tracker_devices'
 const ICONS = ['🔑','🎒','👜','💼','🚗','🐱','🐶','📱','💳','🧸']
 
 const state = {
@@ -33,6 +44,14 @@ const state = {
   envSupport: { ble: true, brave: false, secure: true, message: '' }
 }
 const bleData = {}
+const gattQueue = {}
+
+function enqueueGatt(deviceId, op) {
+  const prev = gattQueue[deviceId] || Promise.resolve()
+  const next = prev.then(() => op()).catch(e => { console.error('[GATT]', e); throw e })
+  gattQueue[deviceId] = next.catch(() => {})
+  return next
+}
 
 async function detectEnvironment() {
   const env = { ble: true, brave: false, secure: true, message: '' }
@@ -60,12 +79,12 @@ async function detectEnvironment() {
 
 function getSettings() {
   const uid = state.currentUser?.id || 'anon'
-  return JSON.parse(localStorage.getItem('BT Tracker_settings_' + uid) || '{"notifications":true,"distanceAlert":true,"distanceThreshold":15,"soundOnFind":true}')
+  return JSON.parse(localStorage.getItem('tracker_settings_' + uid) || '{"notifications":true,"distanceAlert":true,"distanceThreshold":15,"soundOnFind":true}')
 }
 
 function saveSettings(s) {
   const uid = state.currentUser?.id || 'anon'
-  localStorage.setItem('BT Tracker_settings_' + uid, JSON.stringify(s))
+  localStorage.setItem('tracker_settings_' + uid, JSON.stringify(s))
 }
 
 function getUserDisplayName() {
@@ -76,9 +95,9 @@ async function getCurrentLocation() {
   if (!navigator.geolocation) return null
   try {
     const pos = await new Promise((res, rej) => {
-      navigator.geolocation.getCurrentPosition(res, rej, { timeout: 8000, enableHighAccuracy: true, maximumAge: 30000 })
+      navigator.geolocation.getCurrentPosition(res, rej, { timeout: 8000, enableHighAccuracy: true, maximumAge: 15000 })
     })
-    return { lat: pos.coords.latitude, lng: pos.coords.longitude, time: Date.now() }
+    return { lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: pos.coords.accuracy, time: Date.now() }
   } catch (e) {
     return null
   }
@@ -86,10 +105,7 @@ async function getCurrentLocation() {
 
 async function loadDevices() {
   if (!state.currentUser) { state.devices = []; return }
-  const { data, error } = await sb
-    .from('BT Tracker_devices')
-    .select('*')
-    .eq('user_id', state.currentUser.id)
+  const { data, error } = await sb.from(TABLE).select('*').eq('user_id', state.currentUser.id)
   if (error) { console.error(error); return }
   state.devices = (data || []).map(d => ({
     id: d.device_id,
@@ -101,13 +117,14 @@ async function loadDevices() {
       ? { lat: d.last_known_lat, lng: d.last_known_lng, time: d.last_seen ? new Date(d.last_seen).getTime() : null }
       : null,
     connected: false,
-    rssi: null
+    rssi: null,
+    distance: null
   }))
 }
 
 async function syncDevice(d) {
   if (!state.currentUser) return
-  const { error } = await sb.from('BT Tracker_devices').update({
+  const { error } = await sb.from(TABLE).update({
     device_name: d.name,
     icon: d.icon || '🔑',
     battery_level: d.battery,
@@ -120,38 +137,81 @@ async function syncDevice(d) {
   if (error) console.error(error)
 }
 
-function rssiToProximity(rssi) {
-  if (!rssi) return { label: 'Bilinmiyor', m: '?', pct: 0, color: '#94a3b8' }
-  if (rssi > -50) return { label: 'Çok yakın', m: '~1-2m', pct: 90, color: '#10b981' }
-  if (rssi > -65) return { label: 'Yakın', m: '~3-5m', pct: 65, color: '#06b6d4' }
-  if (rssi > -80) return { label: 'Orta', m: '~5-15m', pct: 40, color: '#f59e0b' }
-  return { label: 'Uzak', m: '~15-30m', pct: 15, color: '#ef4444' }
+async function logEvent(dev, reason) {
+  if (!dev || !state.currentUser) return
+  const loc = await getCurrentLocation()
+  if (loc) dev.lastLocation = loc
+  dev.lastSeen = Date.now()
+  await syncDevice(dev)
+  render()
 }
 
-function timeAgo(ts) {
-  if (!ts) return ''
-  const s = Math.floor((Date.now() - ts) / 1000)
-  if (s < 60) return s + ' sn önce'
-  if (s < 3600) return Math.floor(s / 60) + ' dk önce'
-  if (s < 86400) return Math.floor(s / 3600) + ' sa önce'
-  return Math.floor(s / 86400) + ' gün önce'
+function rssiToDistance(rssi) {
+  if (rssi == null || !isFinite(rssi)) return null
+  const d = Math.pow(10, (MEASURED_POWER - rssi) / (10 * N_PATH_LOSS))
+  return Math.max(0.1, Math.min(100, d))
+}
+
+function distanceToProximity(distance, rssi) {
+  if (distance == null) return { label: 'Bilinmiyor', m: '—', pct: 0, color: '#94a3b8', dist: null }
+  const pct = Math.max(5, Math.min(100, 100 - Math.log10(distance + 1) * 50))
+  let label, color
+  if (distance < 1.5) { label = 'Çok yakın'; color = '#10b981' }
+  else if (distance < 4) { label = 'Yakın'; color = '#06b6d4' }
+  else if (distance < 10) { label = 'Orta'; color = '#f59e0b' }
+  else { label = 'Uzak'; color = '#ef4444' }
+  const m = distance < 10 ? distance.toFixed(1) + ' m' : Math.round(distance) + ' m'
+  return { label, m, pct, color, dist: distance, rssi }
 }
 
 function playFindPhone() {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
-    for (let i = 0; i < 5; i++) {
-      [880, 1100].forEach((f, j) => {
+    const freqs = [1760, 2093]
+    for (let i = 0; i < 8; i++) {
+      freqs.forEach((f, j) => {
         const o = ctx.createOscillator(), g = ctx.createGain()
+        o.type = 'square'
         o.connect(g); g.connect(ctx.destination)
-        o.frequency.value = f; g.gain.value = 0.3
-        o.start(ctx.currentTime + i * 0.4 + j * 0.2)
-        o.stop(ctx.currentTime + i * 0.4 + j * 0.2 + 0.2)
+        o.frequency.value = f
+        const t0 = ctx.currentTime + i * 0.3 + j * 0.12
+        g.gain.setValueAtTime(0.0001, t0)
+        g.gain.exponentialRampToValueAtTime(0.35, t0 + 0.02)
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18)
+        o.start(t0)
+        o.stop(t0 + 0.2)
       })
     }
     state.findPhoneActive = true; render()
-    setTimeout(() => { state.findPhoneActive = false; render() }, 2500)
+    setTimeout(() => { state.findPhoneActive = false; render() }, 3000)
   } catch (e) {}
+}
+
+async function startAdvertisementWatch(dev, btDevice) {
+  if (typeof btDevice.watchAdvertisements !== 'function') return
+  try {
+    await btDevice.watchAdvertisements()
+    btDevice.addEventListener('advertisementreceived', (e) => {
+      if (typeof e.rssi !== 'number') return
+      dev.rssi = e.rssi
+      dev.distance = rssiToDistance(e.rssi)
+      render()
+    })
+  } catch (e) {}
+}
+
+async function attachButtonListener(dev, service, charUuid) {
+  try {
+    const ch = await service.getCharacteristic(charUuid)
+    await ch.startNotifications()
+    ch.addEventListener('characteristicvaluechanged', async () => {
+      if (getSettings().soundOnFind) playFindPhone()
+      await logEvent(dev, 'button')
+    })
+    return ch
+  } catch (e) {
+    return null
+  }
 }
 
 async function addDevice() {
@@ -169,16 +229,13 @@ async function addDevice() {
   try {
     btDevice = await navigator.bluetooth.requestDevice({
       filters: [{ services: [TRACKER_SERVICE] }],
-      optionalServices: [BATTERY_SERVICE, BUTTON_SERVICE]
+      optionalServices: [BATTERY_SERVICE, IMMEDIATE_ALERT_SERVICE, BUTTON_SERVICE_UUID]
     })
   } catch (e) {
     if (e.name === 'NotFoundError' || e.name === 'AbortError') return
     let msg = e.name + ': ' + e.message
-    if (e.name === 'SecurityError') {
-      msg = 'Güvenlik hatası. Sayfa HTTPS üzerinde açık olmalı ve Bluetooth izni verilmeli.'
-    } else if (e.name === 'NotSupportedError') {
-      msg = 'BLE Desteklenmiyor. Brave kullanıyorsanız Shields kapalı olmalı ve brave://flags/#brave-web-bluetooth-api etkin olmalı.'
-    }
+    if (e.name === 'SecurityError') msg = 'Güvenlik hatası. Sayfa HTTPS üzerinde açık olmalı ve Bluetooth izni verilmeli.'
+    else if (e.name === 'NotSupportedError') msg = 'BLE Desteklenmiyor. Brave kullanıyorsanız Shields kapalı olmalı ve brave://flags/#brave-web-bluetooth-api etkin olmalı.'
     state.connectError = msg
     render()
     return
@@ -189,10 +246,12 @@ async function addDevice() {
 
   try {
     const server = await btDevice.gatt.connect()
-    const service = await server.getPrimaryService(TRACKER_SERVICE)
 
-    let charLed = null
-    try { charLed = await service.getCharacteristic(LED_CHAR) } catch (e) {}
+    let alertChar = null
+    try {
+      const alertSvc = await server.getPrimaryService(IMMEDIATE_ALERT_SERVICE)
+      alertChar = await alertSvc.getCharacteristic(ALERT_LEVEL_CHAR)
+    } catch (e) {}
 
     let battery = null
     try {
@@ -202,21 +261,10 @@ async function addDevice() {
       battery = bv.getUint8(0)
     } catch (e) {}
 
-    try {
-      const btnSvc = await server.getPrimaryService(BUTTON_SERVICE)
-      const btnChar = await btnSvc.getCharacteristic(BUTTON_CHAR)
-      await btnChar.startNotifications()
-      btnChar.addEventListener('characteristicvaluechanged', () => {
-        if (getSettings().soundOnFind) playFindPhone()
-      })
-    } catch (e) {}
-
-    const loc = await getCurrentLocation()
-
     const id = btDevice.id || 'tag-' + Date.now()
     const existing = state.devices.find(d => d.id === id)
 
-    bleData[id] = { charLed, server, btDevice }
+    const loc = await getCurrentLocation()
 
     const dev = {
       id,
@@ -225,14 +273,25 @@ async function addDevice() {
       battery,
       connected: true,
       rssi: null,
+      distance: null,
       lastSeen: Date.now(),
       lastLocation: loc || existing?.lastLocation || null
     }
 
+    bleData[id] = { alertChar, server, btDevice, buttonChar: null }
+
+    try {
+      const btnSvc = await server.getPrimaryService(BUTTON_SERVICE_UUID)
+      let btnChar = await attachButtonListener(dev, btnSvc, BUTTON_CHAR_UUID)
+      if (!btnChar) btnChar = await attachButtonListener(dev, btnSvc, LEGACY_BUTTON_CHAR_UUID)
+      bleData[id].buttonChar = btnChar
+    } catch (e) {}
+
     btDevice.addEventListener('gattserverdisconnected', async () => {
       const d = state.devices.find(x => x.id === id)
-      if (d) { d.connected = false; d.rssi = null; d.lastSeen = Date.now() }
+      if (d) { d.connected = false; d.rssi = null; d.distance = null; d.lastSeen = Date.now() }
       delete bleData[id]
+      delete gattQueue[id]
       const discLoc = await getCurrentLocation()
       if (d && discLoc) d.lastLocation = discLoc
       if (d) await syncDevice(d)
@@ -242,7 +301,7 @@ async function addDevice() {
       render()
     })
 
-    const { error } = await sb.from('BT Tracker_devices').upsert({
+    const { error } = await sb.from(TABLE).upsert({
       user_id: state.currentUser.id,
       device_id: id,
       device_name: dev.name,
@@ -255,11 +314,10 @@ async function addDevice() {
 
     if (error) console.error(error)
 
-    if (existing) {
-      Object.assign(existing, dev)
-    } else {
-      state.devices.push(dev)
-    }
+    if (existing) Object.assign(existing, dev)
+    else state.devices.push(dev)
+
+    startAdvertisementWatch(existing || dev, btDevice)
   } catch (e) {
     state.connectError = 'Bağlantı hatası: ' + e.message
   }
@@ -268,10 +326,10 @@ async function addDevice() {
   render()
 }
 
-async function ringDevice(deviceId) {
+async function triggerAlert(deviceId, level = 'high') {
   const ble = bleData[deviceId]
-  if (!ble || !ble.charLed) {
-    state.connectError = 'Cihaz bağlı değil veya uyarı karakteristiği bulunamadı.'
+  if (!ble) {
+    state.connectError = 'Etiket bağlı değil.'
     render()
     return
   }
@@ -280,17 +338,45 @@ async function ringDevice(deviceId) {
     render()
     return
   }
+  if (!ble.alertChar) {
+    state.connectError = 'Immediate Alert karakteristiği bulunamadı.'
+    render()
+    return
+  }
+
+  const byte = level === 'mild' ? ALERT_MILD : level === 'none' ? ALERT_NONE : ALERT_HIGH
   state.ringingDeviceId = deviceId
   render()
+
   try {
-    await ble.charLed.writeValue(new Uint8Array([0x01]))
+    await enqueueGatt(deviceId, async () => {
+      if (typeof ble.alertChar.writeValueWithoutResponse === 'function') {
+        await ble.alertChar.writeValueWithoutResponse(new Uint8Array([byte]))
+      } else {
+        await ble.alertChar.writeValue(new Uint8Array([byte]))
+      }
+    })
+    const dev = state.devices.find(x => x.id === deviceId)
+    if (dev) await logEvent(dev, 'alert')
   } catch (e) {
-    state.connectError = 'Ring komutu gönderilemedi: ' + e.message
+    state.connectError = 'Alarm komutu gönderilemedi: ' + e.message
   }
-  setTimeout(() => {
+
+  setTimeout(async () => {
+    if (byte !== ALERT_NONE && ble.alertChar && ble.server && ble.server.connected) {
+      try {
+        await enqueueGatt(deviceId, async () => {
+          if (typeof ble.alertChar.writeValueWithoutResponse === 'function') {
+            await ble.alertChar.writeValueWithoutResponse(new Uint8Array([ALERT_NONE]))
+          } else {
+            await ble.alertChar.writeValue(new Uint8Array([ALERT_NONE]))
+          }
+        })
+      } catch (e) {}
+    }
     state.ringingDeviceId = null
     render()
-  }, 3000)
+  }, 3500)
 }
 
 function disconnectDevice(deviceId) {
@@ -300,12 +386,13 @@ function disconnectDevice(deviceId) {
 
 async function deleteDevice(deviceId) {
   disconnectDevice(deviceId)
-  const { error } = await sb.from('BT Tracker_devices').delete()
+  const { error } = await sb.from(TABLE).delete()
     .eq('user_id', state.currentUser.id)
     .eq('device_id', deviceId)
   if (error) console.error(error)
   state.devices = state.devices.filter(d => d.id !== deviceId)
   delete bleData[deviceId]
+  delete gattQueue[deviceId]
   state.page = 'home'
   state.selectedDeviceId = null
   render()
@@ -352,8 +439,8 @@ function renderLogin(app) {
     </div>
     <div class="card fade-in" style="margin-top:24px">
       <div style="font-size:18px;font-weight:600;margin-bottom:20px;color:#1a1a2e">Giriş Yap</div>
-      <input class="input" id="login-email" placeholder="E-posta" type="email">
-      <input class="input" id="login-pass" placeholder="Şifre" type="password">
+      <input class="input" id="login-email" placeholder="E-posta" type="email" autocomplete="email">
+      <input class="input" id="login-pass" placeholder="Şifre" type="password" autocomplete="current-password">
       <div id="login-err" style="color:#dc2626;font-size:13px;margin-bottom:12px;display:none"></div>
       <button class="btn btn-primary" id="login-btn" onclick="window._kt.doLogin()">Giriş Yap</button>
       <div class="divider"></div>
@@ -427,11 +514,7 @@ async function doRegister() {
   btn.disabled = true
   btn.innerHTML = '<span class="spinner"></span>'
 
-  const { data, error } = await sb.auth.signUp({
-    email,
-    password: pass,
-    options: { data: { name } }
-  })
+  const { data, error } = await sb.auth.signUp({ email, password: pass, options: { data: { name } } })
 
   if (error) {
     err.textContent = error.message
@@ -461,7 +544,7 @@ function renderHome(app) {
       </div>`
   } else {
     state.devices.forEach(d => {
-      const prox = rssiToProximity(d.rssi)
+      const prox = distanceToProximity(d.distance, d.rssi)
       const isOn = d.connected
       const ringing = state.ringingDeviceId === d.id
       deviceCards += `
@@ -487,20 +570,20 @@ function renderHome(app) {
             ${isOn ? `
               <div style="margin-top:14px">
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px">
-                  <span style="font-size:12px;color:#6b7280">Mesafe</span>
-                  <span style="font-size:12px;font-weight:600;color:${prox.color}">${prox.label} (${prox.m})</span>
+                  <span style="font-size:12px;color:#6b7280">Yakınlık</span>
+                  <span style="font-size:12px;font-weight:600;color:${prox.color}" class="prox-text">${prox.label} · ${prox.m}</span>
                 </div>
-                <div class="prox-bar"><div class="prox-fill" style="width:${prox.pct}%;background:${prox.color}"></div></div>
+                <div class="prox-bar"><div class="prox-fill smooth" style="width:${prox.pct}%;background:${prox.color}"></div></div>
               </div>` : ''}
             ${d.lastLocation ? `
-              <div style="margin-top:12px;padding:10px 12px;background:#fafaf8;border-radius:10px;font-size:12px;color:#6b7280;display:flex;justify-content:space-between;align-items:center">
+              <div style="margin-top:12px;padding:10px 12px;background:#fafaf8;border-radius:10px;font-size:12px;color:#6b7280;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
                 <span>📍 ${d.lastLocation.lat.toFixed(4)}, ${d.lastLocation.lng.toFixed(4)} · ${timeAgo(d.lastLocation.time || d.lastSeen)}</span>
-                <a href="https://www.google.com/maps?q=${d.lastLocation.lat},${d.lastLocation.lng}" target="_blank" onclick="event.stopPropagation()" style="color:#4f46e5;text-decoration:none;font-weight:600">Harita →</a>
+                <a href="https://www.google.com/maps?q=${d.lastLocation.lat},${d.lastLocation.lng}" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="color:#4f46e5;text-decoration:none;font-weight:600">Harita →</a>
               </div>` : ''}
           </div>
           ${isOn ? `
-            <button class="btn" style="margin-top:14px;background:${ringing ? '#f59e0b' : 'linear-gradient(135deg,#4f46e5,#7c3aed)'};color:#fff;display:flex;align-items:center;justify-content:center;gap:8px" onclick="event.stopPropagation();window._kt.ringDevice('${d.id}')" ${ringing ? 'disabled' : ''}>
-              ${ringing ? '<span class="spinner"></span> Cihaz Çalıyor...' : '🔔 Cihazı Çaldır'}
+            <button class="btn ring-btn ${ringing ? 'ringing' : ''}" onclick="event.stopPropagation();window._kt.triggerAlert('${d.id}','high')" ${ringing ? 'disabled' : ''}>
+              ${ringing ? '<span class="spinner"></span> Etiket Çalıyor...' : '🔔 Etiketi Çaldır'}
             </button>` : ''}
         </div>`
     })
@@ -532,10 +615,19 @@ function renderHome(app) {
   if (addBtn) addBtn.addEventListener('click', addDevice, { passive: true })
 }
 
+function timeAgo(ts) {
+  if (!ts) return ''
+  const s = Math.floor((Date.now() - ts) / 1000)
+  if (s < 60) return s + ' sn önce'
+  if (s < 3600) return Math.floor(s / 60) + ' dk önce'
+  if (s < 86400) return Math.floor(s / 3600) + ' sa önce'
+  return Math.floor(s / 86400) + ' gün önce'
+}
+
 function renderDetail(app) {
   const d = state.devices.find(x => x.id === state.selectedDeviceId)
   if (!d) { state.page = 'home'; render(); return }
-  const prox = rssiToProximity(d.rssi)
+  const prox = distanceToProximity(d.distance, d.rssi)
   const ringing = state.ringingDeviceId === d.id
 
   let editSection = ''
@@ -575,22 +667,30 @@ function renderDetail(app) {
 
     ${d.connected ? `
       <div class="card fade-in" style="text-align:center">
-        <button class="btn" style="background:${ringing ? '#f59e0b' : 'linear-gradient(135deg,#4f46e5,#7c3aed)'};color:#fff;font-size:16px;padding:18px;display:flex;align-items:center;justify-content:center;gap:10px" onclick="window._kt.ringDevice('${d.id}')" ${ringing ? 'disabled' : ''}>
-          ${ringing ? '<span class="spinner"></span> Cihaz Çalıyor...' : '🔔 Cihazı Çaldır'}
-        </button>
-        <div style="font-size:12px;color:#9ca3af;margin-top:8px">Fiziksel alarm / LED aktif olacak</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <button class="btn ring-btn ${ringing ? 'ringing' : ''}" onclick="window._kt.triggerAlert('${d.id}','high')" ${ringing ? 'disabled' : ''}>
+            ${ringing ? '<span class="spinner"></span> Çalıyor...' : '🔔 Yüksek Alarm'}
+          </button>
+          <button class="btn btn-secondary" onclick="window._kt.triggerAlert('${d.id}','mild')" ${ringing ? 'disabled' : ''}>
+            🔕 Hafif Uyarı
+          </button>
+        </div>
+        <div style="font-size:12px;color:#9ca3af;margin-top:8px">Immediate Alert Service (0x1802)</div>
       </div>
       <div class="card fade-in">
-        <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:12px">📶 Yakınlık</div>
+        <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:12px">📶 Yakınlık (RSSI)</div>
         <div style="text-align:center;margin-bottom:12px">
-          <div style="font-size:36px;font-weight:700;color:${prox.color}">${prox.m}</div>
-          <div style="font-size:14px;color:${prox.color};font-weight:500">${prox.label}</div>
+          <div class="prox-num" style="color:${prox.color}">${prox.m}</div>
+          <div style="font-size:14px;color:${prox.color};font-weight:500" class="prox-text">${prox.label}</div>
         </div>
-        <div class="prox-bar"><div class="prox-fill" style="width:${prox.pct}%;background:${prox.color}"></div></div>
-        ${d.rssi ? `<div style="font-size:11px;color:#9ca3af;margin-top:6px;text-align:right">RSSI: ${d.rssi} dBm</div>` : ''}
+        <div class="prox-bar"><div class="prox-fill smooth" style="width:${prox.pct}%;background:${prox.color}"></div></div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:#9ca3af;margin-top:8px">
+          <span>RSSI: ${d.rssi != null ? d.rssi + ' dBm' : '—'}</span>
+          <span>N=${N_PATH_LOSS} · P₀=${MEASURED_POWER} dBm</span>
+        </div>
       </div>` : `
       <div class="card fade-in" style="text-align:center;padding:24px">
-        <div style="font-size:14px;color:#6b7280;margin-bottom:12px">Cihaz bağlı değil</div>
+        <div style="font-size:14px;color:#6b7280;margin-bottom:12px">Etiket bağlı değil</div>
         <button class="btn btn-primary" id="reconnect-btn">Yeniden Bağlan</button>
       </div>`}
 
@@ -599,16 +699,16 @@ function renderDetail(app) {
         <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:8px">📍 Son Bilinen Konum</div>
         <div style="background:#fafaf8;border-radius:12px;padding:14px">
           <div style="font-size:13px;color:#6b7280">${d.lastLocation.lat.toFixed(6)}, ${d.lastLocation.lng.toFixed(6)}</div>
-          <div style="font-size:11px;color:#9ca3af;margin-top:4px">${timeAgo(d.lastLocation.time || d.lastSeen)}</div>
-          <a href="https://www.google.com/maps?q=${d.lastLocation.lat},${d.lastLocation.lng}" target="_blank" style="display:inline-block;margin-top:10px;font-size:13px;color:#4f46e5;text-decoration:none;font-weight:500">Haritada Göster →</a>
+          <div style="font-size:11px;color:#9ca3af;margin-top:4px">${timeAgo(d.lastLocation.time || d.lastSeen)}${d.lastLocation.accuracy ? ' · ±' + Math.round(d.lastLocation.accuracy) + 'm' : ''}</div>
+          <a href="https://www.google.com/maps?q=${d.lastLocation.lat},${d.lastLocation.lng}" target="_blank" rel="noopener" style="display:inline-block;margin-top:10px;font-size:13px;color:#4f46e5;text-decoration:none;font-weight:500">Haritada Göster →</a>
         </div>
       </div>` : ''}
 
     <div class="card fade-in">
-      <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:12px">Cihaz Ayarları</div>
+      <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:12px">Etiket Ayarları</div>
       ${editSection}
       ${d.connected ? `<button class="btn btn-secondary" style="margin-top:10px" onclick="window._kt.disconnect('${d.id}')">Bağlantıyı Kes</button>` : ''}
-      <button class="btn btn-danger" style="margin-top:8px" onclick="if(confirm('Bu cihazı silmek istediğinize emin misiniz?')) window._kt.deleteDevice('${d.id}')">Cihazı Kaldır</button>
+      <button class="btn btn-danger" style="margin-top:8px" onclick="if(confirm('Bu etiketi silmek istediğinize emin misiniz?')) window._kt.deleteDevice('${d.id}')">Etiketi Kaldır</button>
     </div>
     <div style="height:30px"></div>`
 
@@ -630,7 +730,6 @@ async function saveDeviceEdit(id) {
 
 function renderSettings(app) {
   const s = getSettings()
-
   app.innerHTML = `
     <div class="header-center">
       <button class="back-btn" onclick="window._kt.goTo('home')">←</button>
@@ -652,6 +751,12 @@ function renderSettings(app) {
           <input type="range" min="5" max="30" step="5" value="${s.distanceThreshold || 15}" style="width:100%" onchange="window._kt.updateThreshold(this.value)">
           <div style="display:flex;justify-content:space-between;font-size:11px;color:#9ca3af"><span>5m</span><span>15m</span><span>30m</span></div>
         </div>` : ''}
+    </div>
+    <div class="card fade-in">
+      <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:8px">Teknik Bilgi</div>
+      <div style="font-size:12px;color:#6b7280;line-height:1.6">
+        Bluetooth Low Energy (BLE) tabanlı takip sistemi. Immediate Alert Service ile cihaz üzerindeki alarmı tetikler, RSSI ölçümlerinden Path Loss formülü ile mesafe kestirimi yapar.
+      </div>
     </div>
     <div class="card fade-in">
       <button class="btn btn-danger" onclick="window._kt.doLogout()">Çıkış Yap</button>
@@ -694,9 +799,7 @@ async function doLogout() {
 }
 
 sb.auth.onAuthStateChange((event, session) => {
-  if (event === 'TOKEN_REFRESHED' && session) {
-    state.currentUser = session.user
-  }
+  if (event === 'TOKEN_REFRESHED' && session) state.currentUser = session.user
   if (event === 'SIGNED_OUT') {
     state.currentUser = null
     state.devices = []
@@ -707,7 +810,7 @@ sb.auth.onAuthStateChange((event, session) => {
 
 window._kt = {
   addDevice,
-  ringDevice,
+  triggerAlert,
   doLogin,
   doRegister,
   doLogout,
