@@ -10,7 +10,7 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
 
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-const KEEPER_SERVICE = 0xFEF5
+const TRACKER_SERVICE = 0xFEF5
 const BATTERY_SERVICE = 0x180F
 const BATTERY_CHAR = 0x2A19
 const LED_CHAR = '8082caa8-41a6-4021-91c6-56f9b954cc34'
@@ -168,7 +168,7 @@ async function addDevice() {
   let btDevice
   try {
     btDevice = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [KEEPER_SERVICE] }],
+      filters: [{ services: [TRACKER_SERVICE] }],
       optionalServices: [BATTERY_SERVICE, BUTTON_SERVICE]
     })
   } catch (e) {
@@ -189,7 +189,7 @@ async function addDevice() {
 
   try {
     const server = await btDevice.gatt.connect()
-    const service = await server.getPrimaryService(KEEPER_SERVICE)
+    const service = await server.getPrimaryService(TRACKER_SERVICE)
 
     let charLed = null
     try { charLed = await service.getCharacteristic(LED_CHAR) } catch (e) {}
@@ -213,14 +213,14 @@ async function addDevice() {
 
     const loc = await getCurrentLocation()
 
-    const id = btDevice.id || 'keeper-' + Date.now()
+    const id = btDevice.id || 'tag-' + Date.now()
     const existing = state.devices.find(d => d.id === id)
 
     bleData[id] = { charLed, server, btDevice }
 
     const dev = {
       id,
-      name: existing ? existing.name : (btDevice.name || 'Keeper'),
+      name: existing ? existing.name : (btDevice.name || 'Smart Tag'),
       icon: existing ? existing.icon : '🔑',
       battery,
       connected: true,
@@ -237,7 +237,7 @@ async function addDevice() {
       if (d && discLoc) d.lastLocation = discLoc
       if (d) await syncDevice(d)
       if (getSettings().notifications && 'Notification' in window && Notification.permission === 'granted') {
-        new Notification('Keeper Tracker', { body: dev.name + ' bağlantısı kesildi!' })
+        new Notification('Smart BT Tracker', { body: dev.name + ' bağlantısı kesildi!' })
       }
       render()
     })
@@ -318,7 +318,7 @@ function render() {
       <div class="overlay">
         <div style="font-size:72px;margin-bottom:16px;animation:shake 0.3s infinite">📱</div>
         <div style="font-size:22px;font-weight:700;color:#fff">Telefonunuz burada!</div>
-        <div style="font-size:14px;color:rgba(255,255,255,0.8);margin-top:6px">Keeper butonuna basıldı</div>
+        <div style="font-size:14px;color:rgba(255,255,255,0.8);margin-top:6px">Etiket butonuna basıldı</div>
         <button class="btn btn-primary" style="width:auto;padding:12px 32px;margin-top:24px" onclick="window._kt.findPhoneDismiss()">Tamam</button>
       </div>`
     return
@@ -347,7 +347,7 @@ function renderLogin(app) {
   app.innerHTML = `
     <div style="background:#1a1a2e;color:#fff;padding:40px 24px 30px;text-align:center">
       <div style="width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,#4f46e5,#7c3aed);display:flex;align-items:center;justify-content:center;font-size:24px;margin:0 auto 12px">📍</div>
-      <div class="logo">Keeper Tracker</div>
+      <div class="logo">Smart BT Tracker</div>
       <div class="logo-sub">Eşyalarınızı asla kaybetmeyin</div>
     </div>
     <div class="card fade-in" style="margin-top:24px">
@@ -394,7 +394,7 @@ function renderRegister(app) {
   app.innerHTML = `
     <div style="background:#1a1a2e;color:#fff;padding:40px 24px 30px;text-align:center">
       <div style="width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,#4f46e5,#7c3aed);display:flex;align-items:center;justify-content:center;font-size:24px;margin:0 auto 12px">📍</div>
-      <div class="logo">Keeper Tracker</div>
+      <div class="logo">Smart BT Tracker</div>
       <div class="logo-sub">Yeni hesap oluşturun</div>
     </div>
     <div class="card fade-in" style="margin-top:24px">
@@ -456,8 +456,8 @@ function renderHome(app) {
     deviceCards = `
       <div style="text-align:center;padding:40px 20px;color:#9ca3af">
         <div style="font-size:48px;margin-bottom:12px">📍</div>
-        <div style="font-size:16px;font-weight:600;color:#6b7280">Henüz cihaz eklenmedi</div>
-        <div style="font-size:13px;margin-top:6px">Keeper cihazınızı eklemek için aşağıdaki butona basın</div>
+        <div style="font-size:16px;font-weight:600;color:#6b7280">Henüz etiket eklenmedi</div>
+        <div style="font-size:13px;margin-top:6px">Takip cihazınızı eklemek için aşağıdaki butona basın</div>
       </div>`
   } else {
     state.devices.forEach(d => {
@@ -509,7 +509,7 @@ function renderHome(app) {
   app.innerHTML = `
     <div class="header">
       <div>
-        <div class="logo">📍 Keeper Tracker</div>
+        <div class="logo">📍 Smart BT Tracker</div>
         <div class="logo-sub">Merhaba, ${getUserDisplayName()}</div>
       </div>
       <button class="settings-btn" onclick="window._kt.goTo('settings')">⚙️</button>
@@ -524,7 +524,7 @@ function renderHome(app) {
     <div style="padding:12px 16px 24px">
       ${state.connectError ? `<div style="background:#fef2f2;border:1.5px solid #fecaca;border-radius:12px;padding:12px 14px;margin-bottom:12px;font-size:13px;color:#dc2626;display:flex;align-items:flex-start;gap:8px"><span style="font-size:16px;flex-shrink:0">⚠️</span><span>${state.connectError}</span></div>` : ''}
       <button class="btn btn-primary" id="add-device-btn" ${state.connecting ? 'disabled' : ''} style="display:flex;align-items:center;justify-content:center;gap:8px;${state.connecting ? 'opacity:0.7' : ''}">
-        ${state.connecting ? '<span class="spinner"></span> Bağlanıyor...' : '➕ Cihaz Ekle'}
+        ${state.connecting ? '<span class="spinner"></span> Bağlanıyor...' : '➕ Yeni Etiket Ekle'}
       </button>
     </div>`
 
@@ -645,7 +645,7 @@ function renderSettings(app) {
       <div style="font-size:14px;font-weight:600;color:#1a1a2e;margin-bottom:16px">Bildirim Ayarları</div>
       ${renderToggle('notifications', 'Bildirimler', 'Bağlantı kopunca bildirim al', s.notifications)}
       ${renderToggle('distanceAlert', 'Mesafe Uyarısı', 'Belirlenen mesafeden uzaklaşınca uyar', s.distanceAlert)}
-      ${renderToggle('soundOnFind', 'Telefonu Buldur', 'Keeper butonuna basınca telefon ötsün', s.soundOnFind)}
+      ${renderToggle('soundOnFind', 'Telefonu Buldur', 'Etiket butonuna basınca telefon ötsün', s.soundOnFind)}
       ${s.distanceAlert ? `
         <div style="margin-top:16px">
           <div style="font-size:13px;color:#6b7280;margin-bottom:8px">Uyarı mesafesi: ${s.distanceThreshold || 15}m</div>
